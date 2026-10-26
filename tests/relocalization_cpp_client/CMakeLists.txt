@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.16)
+project(reloc_external_cpp_check)
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(fast_lio REQUIRED)
+add_executable(reloc_cpp_client client.cpp)
+ament_target_dependencies(reloc_cpp_client rclcpp fast_lio)

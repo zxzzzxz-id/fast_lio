@@ -33,6 +33,7 @@ def generate_launch_description():
     params.update(flatten_yaml(package_dir / "config" / "reloc" / "mid360.yaml"))
     # Localization must never overwrite the prior map on shutdown.
     params["pcd_save/pcd_save_en"] = False
+    params["reloc/reloc_en"] = False
     relocalization_params = str(
         package_dir / "config" / "reloc" / "relocalization.yaml")
     map_pcd = LaunchConfiguration("map_pcd")
@@ -78,7 +79,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "start_relocalizer", default_value="true",
             description="是否启动 ICP 重定位节点"),
-        # fast_lio 本体：mapping 配置叠加 reloc 配置（reloc_en=true）
+        # fast_lio 本体：mapping 配置叠加 reloc 配置（reloc_en=false）
         Node(
             package="fast_lio",
             executable="fastlio_mapping",
@@ -88,7 +89,7 @@ def generate_launch_description():
         ),
         # 先验 PCD -> /map；未安装栅格包时只提示并跳过。
         grid_action,
-        # ICP 重定位 -> /reloc/cloud_align
+        # 重定位服务 -> map/odom 修正与 /reloc/pose
         Node(
             package="fast_lio",
             executable="icp_relocalizer",

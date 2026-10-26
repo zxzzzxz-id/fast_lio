@@ -1,0 +1,146 @@
+[
+  {
+    "case": "missing_odometry",
+    "success": false,
+    "message": "missing or stale odometry (check topic, frames and use_sim_time)",
+    "frames": 0,
+    "correspondences": 0,
+    "rmse": 0.0,
+    "elapsed": 0.0
+  },
+  {
+    "case": "invalid_mode",
+    "success": false,
+    "message": "invalid mode: expected MANUAL=0 or ODOMETRY=1",
+    "frames": 0,
+    "correspondences": 0,
+    "rmse": 0.0,
+    "elapsed": 0.0
+  },
+  {
+    "case": "invalid_manual",
+    "success": false,
+    "message": "manual x/y/z/yaw_deg must be finite",
+    "frames": 0,
+    "correspondences": 0,
+    "rmse": 0.0,
+    "elapsed": 0.0
+  },
+  {
+    "case": "manual_success",
+    "success": true,
+    "message": "relocalized: map -> odom updated; local odometry remains continuous",
+    "frames": 10,
+    "correspondences": 4409,
+    "rmse": 0.001358295031990451,
+    "elapsed": 0.562123528
+  },
+  {
+    "case": "odometry_repeat_nonidentity_correction",
+    "success": true,
+    "message": "relocalized: map -> odom updated; local odometry remains continuous",
+    "frames": 10,
+    "correspondences": 4409,
+    "rmse": 0.0013583552451599443,
+    "elapsed": 0.538575683
+  },
+  {
+    "case": "concurrent_busy",
+    "success": false,
+    "message": "busy: another relocalization is collecting or computing",
+    "frames": 0,
+    "correspondences": 0,
+    "rmse": 0.0,
+    "elapsed": 0.0
+  },
+  {
+    "case": "extension_success",
+    "success": true,
+    "message": "relocalized: map -> odom updated; local odometry remains continuous",
+    "frames": 20,
+    "correspondences": 4409,
+    "rmse": 0.0008529741611424288,
+    "elapsed": 0.993639478
+  },
+  {
+    "case": "insufficient_after_extension",
+    "success": false,
+    "message": "insufficient effective points after temporal/voxel filtering",
+    "frames": 20,
+    "correspondences": 0,
+    "rmse": 0.0,
+    "elapsed": 0.862222754
+  },
+  {
+    "case": "registration_rejected",
+    "success": false,
+    "message": "coarse ICP failed convergence or RMSE gate",
+    "frames": 10,
+    "correspondences": 0,
+    "rmse": 0.0,
+    "elapsed": 0.523461116
+  },
+  {
+    "case": "reference_tf_missing",
+    "success": false,
+    "message": "registration exception: missing odom -> base_link at reference scan timestamp: Lookup would require extrapolation into the future.  Requested time 1793014227.941797 but the latest data is at time 1793014227.442691, when looking up transform from frame [base_link] to frame [odom]",
+    "frames": 10,
+    "correspondences": 0,
+    "rmse": 0.0,
+    "elapsed": 0.68835105
+  },
+  {
+    "case": "stale_odometry",
+    "success": false,
+    "message": "missing or stale odometry (check topic, frames and use_sim_time)",
+    "frames": 0,
+    "correspondences": 0,
+    "rmse": 0.0,
+    "elapsed": 0.0
+  },
+  {
+    "case": "worker_timeout",
+    "success": false,
+    "message": "timeout: collection or registration exceeded service_timeout_sec",
+    "frames": 1,
+    "correspondences": 0,
+    "rmse": 0.0,
+    "elapsed": 0.309536249
+  },
+  {
+    "case": "busy_until_late_worker_exits",
+    "success": false,
+    "message": "busy: another relocalization is collecting or computing",
+    "frames": 0,
+    "correspondences": 0,
+    "rmse": 0.0,
+    "elapsed": 0.0
+  },
+  {
+    "case": "recovery_after_late_result_discard",
+    "success": true,
+    "message": "relocalized: map -> odom updated; local odometry remains continuous",
+    "frames": 1,
+    "correspondences": 4409,
+    "rmse": 0.0013583231020466264,
+    "elapsed": 0.093327252
+  },
+  {
+    "case": "service_after_startup_and_legacy",
+    "success": true,
+    "message": "relocalized: map -> odom updated; local odometry remains continuous",
+    "frames": 10,
+    "correspondences": 4409,
+    "rmse": 0.001358344415770419,
+    "elapsed": 0.553784771
+  },
+  {
+    "case": "wall_timeout_with_paused_clock",
+    "success": false,
+    "message": "timeout: collection or registration exceeded service_timeout_sec",
+    "frames": 0,
+    "correspondences": 0,
+    "rmse": 0.0,
+    "elapsed": 0.608933448
+  }
+]

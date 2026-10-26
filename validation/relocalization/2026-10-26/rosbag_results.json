@@ -1,0 +1,35 @@
+{
+  "startup_pose_count": 1,
+  "odometry_service": {
+    "mode": 1,
+    "success": true,
+    "message": "relocalized: map -> odom updated; local odometry remains continuous",
+    "frames": 10,
+    "correspondences": 4820,
+    "rmse": 0.017998519371388275,
+    "overlap": 1.0,
+    "elapsed": 0.687219466,
+    "odometry_messages_during_call": 14
+  },
+  "manual_service": {
+    "mode": 0,
+    "success": true,
+    "message": "relocalized: map -> odom updated; local odometry remains continuous",
+    "frames": 10,
+    "correspondences": 4316,
+    "rmse": 0.017699815466233813,
+    "overlap": 1.0,
+    "elapsed": 0.642130472,
+    "odometry_messages_during_call": 13
+  },
+  "odometry_messages": 145,
+  "high_frequency_messages": 1447,
+  "reset_pose_messages": 0,
+  "map_to_odom_messages": 154,
+  "span_sec": 7.201389789581299,
+  "max_adjacent_position_change_m": 0.009375680114360947,
+  "max_odometry_gap_sec": 0.0546879768371582,
+  "positions_finite": true,
+  "checks_passed": true,
+  "frontend_reset_logs": false
+}

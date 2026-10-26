@@ -25,10 +25,10 @@ icp_relocalizer:
     request_topic: "/reloc/request"
     # 匹配前先把点云变换到这个坐标系，ICP 结果直接就是这个坐标系的位姿
     base_frame: "base_link"
-    # 输出位姿的 frame_id（fast_lio reloc 要求是 odom 或空）
+    # 本地里程计坐标系；输出位姿和对齐点云使用 map_frame。
     odom_frame: "odom"
-    # 输出话题：fast_lio 的重定位接口
-    output_topic: "/reloc/cloud_align"
+    # 输出话题：地图坐标中的重定位结果，不输入 FAST-LIO 重置接口。
+    output_topic: "/reloc/pose"
     # 兼容旧参数；新流程实际使用 coarse/fine distance。
     max_correspondence_distance: 1.0
     max_iterations: 50
@@ -46,11 +46,11 @@ icp_relocalizer:
     min_correspondences: 300
     # 先攒这么多非空帧，检验时间过滤及粗/精降采样后的有效点数。
     # 通过后进入配准；不足时保留已有点云，追加 additional_accumulate_frames 再检验。
-    # 追加后仍不足则拒绝本轮、清空并重新累积（10Hz 下 30 帧 ≈ 3 秒）。
+    # 追加后仍不足则拒绝本轮；服务返回失败（10Hz 下 10 帧 ≈ 1 秒）。
     # 融合期间机器人要基本静止。设 1 = 用单帧（不推荐，容易滑）
-    accumulate_frames: 30
-    # 有效点数不足时仅追加一次（默认最多 30+20=50 帧）；0 表示不追加。
-    additional_accumulate_frames: 20
+    accumulate_frames: 10
+    # 有效点数不足时仅追加一次（默认最多 10+10=20 帧）；0 表示不追加。
+    additional_accumulate_frames: 10
     # 冷启动保护：启动后这段时间内不匹配，等 fast_lio 出稳定的点云（秒）
     startup_delay: 5.0
     # 地面机器人 roll/pitch 应接近 0，超过这个角度视为误匹配（度）
@@ -59,21 +59,25 @@ icp_relocalizer:
     max_correction_dist: 2.0
     # 相对初值的最大 yaw 修正量，超过认为超出当前粗配准捕获范围（度）
     max_yaw_correction_deg: 35.0
-    # 用当前 odom->base_link 作为 ICP 初值（先验图与起点接近时推荐）
-    use_odom_as_initial_guess: true
-    # 初值上再叠加的偏移（米 / 弧度）
+    # 开机自动初值的附加偏移（米 / 弧度）；服务初值不叠加这些值。
     initial_x: 0.0
     initial_y: 0.0
     initial_z: 0.0
     initial_yaw: 0.0
     # 匹配成功后只发布一次
     one_shot: true
-    # true: 启动后自动跑一次；false: 只响应 request_topic。
+    # true: 保留开机自动配准；false: 仅响应服务和 request_topic。
     auto_relocalize_on_start: true
     # 两次匹配之间的最小间隔（秒）
     cooldown: 3.0
-    # 重定位成功后发布静态 map->odom（重定位后 odom 已对齐到先验图）
-    publish_static_map_to_odom: true
+    # 服务：/reloc/relocalize，fast_lio/srv/Relocalize。
+    map_frame: "map"
+    odom_topic: "/Odometry"
+    service_timeout_sec: 10.0
+    odom_max_age_sec: 0.5
+    tf_wait_sec: 0.2
+    # 动态发布全局修正；首次成功前为单位变换，并不代表已完成定位。
+    map_to_odom_publish_rate: 20.0
     # 时间一致性过滤：启动静止时，保留跨多帧重复出现的 voxel。
     time_consistency_filter_en: true
     time_consistency_voxel: 0.15

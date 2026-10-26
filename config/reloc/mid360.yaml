@@ -1,5 +1,4 @@
-# Overlay loaded after config/mapping/mid360.yaml.
-# The pose topic is geometry_msgs/msg/PoseStamped in the odom frame.
+# Prior-map registration corrects map -> odom without resetting the frontend.
 reloc:
-    reloc_en: true
+    reloc_en: false
     reloc_topic: "/reloc/cloud_align"

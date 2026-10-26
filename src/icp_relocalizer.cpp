@@ -1,23 +1,12 @@
-// Two-stage PCL relocalization: align a stationary multi-frame local cloud to a
-// prior PCD map and publish the compatible FAST-LIO reloc pose.
-//
-// Pipeline:
-// 1. Load prior PCD and build coarse/fine targets.
-// 2. Accumulate startup clouds in base_frame while the robot is expected static.
-// 3. Remove low time-consistency voxels before registration.
-// 4. Coarse point-to-point ICP gets into the correct basin.
-// 5. Filter source points by prior-map consistency using the coarse pose.
-// 6. Fine GICP refines x/y/yaw and validates overlap before publishing.
-//
-// Convention: FAST-LIO reloc input is T_robot^odom. After a successful
-// relocalization this system keeps map->odom as identity, so the map pose is
-// published with frame_id=odom on /reloc/cloud_align.
-
+// Stationary prior-map registration service. Only map -> odom is corrected.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <memory>
+#include <future>
+#include <thread>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -26,6 +15,8 @@
 
 #include <Eigen/Geometry>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <fast_lio/srv/relocalize.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <pcl/common/transforms.h>
 #include <pcl/filters/passthrough.h>
@@ -42,7 +33,7 @@
 #include <std_msgs/msg/empty.hpp>
 #include <tf2/time.h>
 #include <tf2_ros/buffer.h>
-#include <tf2_ros/static_transform_broadcaster.h>
+#include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
 
 using PointCloud = pcl::PointCloud<pcl::PointXYZ>;
@@ -100,6 +91,17 @@ double wrap_deg(double angle)
 class IcpRelocalizer : public rclcpp::Node
 {
 public:
+  using Relocalize = fast_lio::srv::Relocalize;
+  using SteadyClock = std::chrono::steady_clock;
+
+  ~IcpRelocalizer() override
+  {
+    // The worker reads target clouds and the TF buffer owned by this node.
+    if (worker_.valid()) {
+      worker_.wait();
+    }
+  }
+
   IcpRelocalizer() : Node("icp_relocalizer")
   {
     pcd_file_ = declare_parameter<std::string>("pcd_file", "");
@@ -124,7 +126,7 @@ public:
     request_topic_ = declare_parameter<std::string>("request_topic", "/reloc/request");
     base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
     odom_frame_ = declare_parameter<std::string>("odom_frame", "odom");
-    output_topic_ = declare_parameter<std::string>("output_topic", "/reloc/cloud_align");
+    output_topic_ = declare_parameter<std::string>("output_topic", "/reloc/pose");
 
     coarse_max_correspondence_distance_ = declare_parameter<double>(
       "coarse_max_correspondence_distance", std::max(legacy_corr_dist, 1.5));
@@ -156,10 +158,8 @@ public:
     max_correction_dist_ = declare_parameter<double>("max_correction_dist", 2.0);
     max_yaw_correction_deg_ =
       declare_parameter<double>("max_yaw_correction_deg", 35.0);
-    accumulate_frames_ = declare_parameter<int>("accumulate_frames", 30);
-    additional_accumulate_frames_ = declare_parameter<int>("additional_accumulate_frames", 20);
-    use_odom_as_initial_guess_ =
-      declare_parameter<bool>("use_odom_as_initial_guess", true);
+    accumulate_frames_ = declare_parameter<int>("accumulate_frames", 10);
+    additional_accumulate_frames_ = declare_parameter<int>("additional_accumulate_frames", 10);
     initial_x_ = declare_parameter<double>("initial_x", 0.0);
     initial_y_ = declare_parameter<double>("initial_y", 0.0);
     initial_z_ = declare_parameter<double>("initial_z", 0.0);
@@ -168,8 +168,20 @@ public:
     auto_relocalize_on_start_ =
       declare_parameter<bool>("auto_relocalize_on_start", true);
     cooldown_ = declare_parameter<double>("cooldown", 3.0);
-    publish_static_map_to_odom_ =
-      declare_parameter<bool>("publish_static_map_to_odom", true);
+    map_frame_ = declare_parameter<std::string>("map_frame", "map");
+    odom_topic_ = declare_parameter<std::string>("odom_topic", "/Odometry");
+    service_timeout_sec_ = declare_parameter<double>("service_timeout_sec", 10.0);
+    odom_max_age_sec_ = declare_parameter<double>("odom_max_age_sec", 0.5);
+    tf_wait_sec_ = declare_parameter<double>("tf_wait_sec", 0.2);
+    map_to_odom_publish_rate_ = declare_parameter<double>("map_to_odom_publish_rate", 20.0);
+    if (!std::isfinite(service_timeout_sec_) || service_timeout_sec_ <= 0.0 ||
+        !std::isfinite(odom_max_age_sec_) || odom_max_age_sec_ <= 0.0 ||
+        !std::isfinite(tf_wait_sec_) || tf_wait_sec_ < 0.0 ||
+        !std::isfinite(map_to_odom_publish_rate_) || map_to_odom_publish_rate_ <= 0.0 ||
+        map_frame_.empty() || map_frame_ == odom_frame_ ||
+        map_frame_ == base_frame_ || odom_frame_ == base_frame_) {
+      throw std::runtime_error("Invalid service timing or frame parameters");
+    }
 
     time_consistency_filter_en_ =
       declare_parameter<bool>("time_consistency_filter_en", true);
@@ -191,6 +203,12 @@ public:
       throw std::runtime_error(
         "accumulate_frames must be positive and additional_accumulate_frames non-negative");
     }
+    if (min_source_points_ <= 0 || min_map_consistent_points_ <= 0 ||
+        min_correspondences_ <= 0 || gicp_correspondence_randomness_ < 3 ||
+        !std::isfinite(startup_delay_) || startup_delay_ < 0.0 ||
+        !std::isfinite(cooldown_) || cooldown_ < 0.0) {
+      throw std::runtime_error("Invalid point-count, neighborhood or startup parameters");
+    }
     if (fine_map_voxel_ <= 0.0 || fine_source_voxel_ <= 0.0 ||
         coarse_map_voxel_ <= 0.0 || coarse_source_voxel_ <= 0.0) {
       throw std::runtime_error("voxel sizes must be positive");
@@ -200,12 +218,12 @@ public:
 
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
-    static_broadcaster_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
-    if (publish_static_map_to_odom_) {
-      publish_map_to_odom();
-      RCLCPP_INFO(
-        get_logger(), "已发布静态 map -> odom = 单位阵（重定位后 odom 仍与 map 重合）");
-    }
+    broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+    tf_timer_ = create_wall_timer(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<double>(1.0 / map_to_odom_publish_rate_)),
+      [this]() { publish_map_to_odom(); });
+    RCLCPP_INFO(get_logger(), "map -> odom initialized to identity; not localized yet");
 
     publisher_ = create_publisher<geometry_msgs::msg::PoseStamped>(output_topic_, 10);
     if (debug_publish_clouds_) {
@@ -226,22 +244,24 @@ public:
     request_subscription_ = create_subscription<std_msgs::msg::Empty>(
       request_topic_, 10,
       std::bind(&IcpRelocalizer::request_callback, this, std::placeholders::_1));
-    active_ = auto_relocalize_on_start_;
-
+    odom_subscription_ = create_subscription<nav_msgs::msg::Odometry>(
+      odom_topic_, rclcpp::SensorDataQoS(),
+      [this](nav_msgs::msg::Odometry::ConstSharedPtr msg) { odom_callback(msg); });
+    service_ = create_service<Relocalize>(
+      "/reloc/relocalize",
+      [this](std::shared_ptr<rmw_request_id_t> header,
+        std::shared_ptr<Relocalize::Request> request) { service_callback(header, request); });
+    auto_pending_ = auto_relocalize_on_start_;
+    next_auto_ = SteadyClock::now() + std::chrono::duration_cast<SteadyClock::duration>(
+      std::chrono::duration<double>(startup_delay_));
+    progress_timer_ = create_wall_timer(
+      std::chrono::milliseconds(10), [this]() { progress(); });
     RCLCPP_INFO(
       get_logger(),
-      "等待 %s，request=%s auto_start=%s accumulate=%d | coarse ICP voxel %.2f/%.2f dist %.2f | fine GICP voxel %.2f/%.2f dist %.2f | 输出 %s",
-      input_topic_.c_str(), request_topic_.c_str(),
-      auto_relocalize_on_start_ ? "true" : "false", accumulate_frames_,
-      coarse_map_voxel_, coarse_source_voxel_, coarse_max_correspondence_distance_,
-      fine_map_voxel_, fine_source_voxel_, fine_max_correspondence_distance_,
-      output_topic_.c_str());
-    if (!auto_relocalize_on_start_) {
-      RCLCPP_INFO(
-        get_logger(),
-        "auto_relocalize_on_start=false，等待外部请求: ros2 topic pub --once %s std_msgs/msg/Empty '{}'",
-        request_topic_.c_str());
-    }
+      "Service /reloc/relocalize ready (MANUAL=0, ODOMETRY=1), auto_start=%s; "
+      "accumulate=%d+%d frames, timeout=%.1fs; output=%s [%s]",
+      auto_pending_ ? "true" : "false", accumulate_frames_, additional_accumulate_frames_,
+      service_timeout_sec_, output_topic_.c_str(), map_frame_.c_str());
   }
 
 private:
@@ -259,41 +279,222 @@ private:
     double ratio{0.0};
   };
 
-  void request_callback(const std_msgs::msg::Empty::SharedPtr)
+  struct PipelineResult
   {
-    begin_relocalization("external request", true);
+    enum Outcome { ACCEPTED, NEED_MORE, REJECTED } outcome{REJECTED};
+    std::string message;
+    Eigen::Matrix4f pose{Eigen::Matrix4f::Identity()};
+    Eigen::Matrix4f odom_pose{Eigen::Matrix4f::Identity()};
+    double rmse{0.0};
+    OverlapStats overlap;
+    builtin_interfaces::msg::Time stamp;
+  };
+
+  static Eigen::Matrix4f pose_matrix(const geometry_msgs::msg::Pose & pose)
+  {
+    const auto & q = pose.orientation;
+    Eigen::Quaternionf rotation(q.w, q.x, q.y, q.z);
+    if (!rotation.coeffs().allFinite() || rotation.squaredNorm() < 1e-12 ||
+        !std::isfinite(pose.position.x) || !std::isfinite(pose.position.y) ||
+        !std::isfinite(pose.position.z)) {
+      throw std::runtime_error("Invalid pose");
+    }
+    Eigen::Matrix4f result = Eigen::Matrix4f::Identity();
+    result.block<3, 3>(0, 0) = rotation.normalized().toRotationMatrix();
+    result.block<3, 1>(0, 3) = Eigen::Vector3f(
+      pose.position.x, pose.position.y, pose.position.z);
+    if (!result.allFinite()) {
+      throw std::runtime_error("Pose exceeds representable range");
+    }
+    return result;
   }
 
-  void begin_relocalization(const std::string & reason, bool capture_guess_now)
+  void odom_callback(const nav_msgs::msg::Odometry::ConstSharedPtr & msg)
   {
-    reset_accumulator();
-    done_ = false;
-    active_ = true;
-    start_time_ = std::chrono::steady_clock::now() -
-      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-        std::chrono::duration<double>(startup_delay_));
-    last_attempt_ = std::chrono::steady_clock::time_point{};
-    have_run_initial_guess_ = false;
-    run_initial_guess_used_odom_ = false;
-
-    if (capture_guess_now) {
-      run_initial_guess_ = initial_guess(&run_initial_guess_used_odom_);
-      have_run_initial_guess_ = true;
+    if (msg->header.frame_id != odom_frame_ || msg->child_frame_id != base_frame_) {
+      return;
     }
+    try {
+      const auto pose = pose_matrix(msg->pose.pose);
+      const rclcpp::Time stamp(msg->header.stamp, get_clock()->get_clock_type());
+      if (stamp.nanoseconds() <= 0 || (have_odom_ && stamp <= odom_stamp_)) {
+        return;
+      }
+      odom_pose_ = pose;
+      odom_stamp_ = stamp;
+      odom_received_ = SteadyClock::now();
+      have_odom_ = true;
+    } catch (const std::exception & e) {
+      RCLCPP_WARN(get_logger(), "Ignoring odometry: %s", e.what());
+    }
+  }
 
+  bool begin_job(const Relocalize::Request & request, bool automatic, std::string & error)
+  {
+    if (active_ || worker_.valid()) {
+      error = "busy: another relocalization is collecting or computing";
+      return false;
+    }
+    if (request.mode != Relocalize::Request::MANUAL &&
+        request.mode != Relocalize::Request::ODOMETRY) {
+      error = "invalid mode: expected MANUAL=0 or ODOMETRY=1";
+      return false;
+    }
+    Eigen::Matrix4f guess = Eigen::Matrix4f::Identity();
+    if (request.mode == Relocalize::Request::MANUAL) {
+      if (!std::isfinite(request.x) || !std::isfinite(request.y) ||
+          !std::isfinite(request.z) || !std::isfinite(request.yaw_deg)) {
+        error = "manual x/y/z/yaw_deg must be finite";
+        return false;
+      }
+      guess.block<3, 3>(0, 0) = Eigen::AngleAxisf(
+        static_cast<float>(std::remainder(request.yaw_deg, 360.0) * M_PI / 180.0),
+        Eigen::Vector3f::UnitZ()).toRotationMatrix();
+      guess.block<3, 1>(0, 3) = Eigen::Vector3f(request.x, request.y, request.z);
+    } else {
+      if (!have_odom_ || std::chrono::duration<double>(
+          SteadyClock::now() - odom_received_).count() > odom_max_age_sec_ ||
+          std::abs((now() - odom_stamp_).seconds()) > odom_max_age_sec_) {
+        error = "missing or stale odometry (check topic, frames and use_sim_time)";
+        return false;
+      }
+      guess = map_to_odom_ * odom_pose_;
+    }
+    // Preserve the configured startup-only seed offset (yaw is radians in YAML).
+    if (automatic) {
+      Eigen::Matrix4f offset = Eigen::Matrix4f::Identity();
+      offset.block<3, 3>(0, 0) = Eigen::AngleAxisf(
+        static_cast<float>(initial_yaw_), Eigen::Vector3f::UnitZ()).toRotationMatrix();
+      offset.block<3, 1>(0, 3) = Eigen::Vector3f(initial_x_, initial_y_, initial_z_);
+      guess = guess * offset;
+    }
+    if (!guess.allFinite()) {
+      error = "initial pose exceeds representable range";
+      return false;
+    }
+    reset_accumulator();
+    run_initial_guess_ = guess;
+    job_start_ = SteadyClock::now();
+    accepted_after_ = now();
+    last_cloud_stamp_ = accepted_after_;
+    job_automatic_ = automatic;
+    active_ = true;
+    if (!automatic) {
+      auto_pending_ = false;
+    }
     RCLCPP_INFO(
-      get_logger(),
-      "收到重定位触发: %s，清空累计并重新开始；本轮初值%s odom->%s",
-      reason.c_str(),
-      have_run_initial_guess_ ?
-      (run_initial_guess_used_odom_ ? "已取自 FAST-LIO odom TF" : "使用 YAML fallback") :
-      "将在首帧取 FAST-LIO odom TF",
-      base_frame_.c_str());
-    if (have_run_initial_guess_) {
-      RCLCPP_INFO(
-        get_logger(), "请求初值: xyz=(%.3f, %.3f, %.3f) yaw=%.1f°",
-        run_initial_guess_(0, 3), run_initial_guess_(1, 3), run_initial_guess_(2, 3),
-        yaw_deg(run_initial_guess_));
+      get_logger(), "Relocalization started: %s mode=%u xyz=(%.3f %.3f %.3f) yaw=%.1fdeg",
+      automatic ? "startup" : "request", request.mode,
+      guess(0, 3), guess(1, 3), guess(2, 3), yaw_deg(guess));
+    return true;
+  }
+
+  void service_callback(
+    const std::shared_ptr<rmw_request_id_t> & header,
+    const std::shared_ptr<Relocalize::Request> & request)
+  {
+    std::string error;
+    if (!begin_job(*request, false, error)) {
+      Relocalize::Response response;
+      response.message = error;
+      service_->send_response(*header, response);
+      return;
+    }
+    request_header_ = header;  // rclcpp deferred response: executor remains available.
+  }
+
+  void request_callback(const std_msgs::msg::Empty::SharedPtr)
+  {
+    Relocalize::Request request;
+    request.mode = Relocalize::Request::ODOMETRY;
+    std::string error;
+    if (!begin_job(request, false, error)) {
+      RCLCPP_WARN(get_logger(), "/reloc/request rejected: %s", error.c_str());
+    }
+  }
+
+  void finish_job(Relocalize::Response response)
+  {
+    response.accumulated_frames = frame_count_;
+    response.elapsed_sec = std::chrono::duration<double>(SteadyClock::now() - job_start_).count();
+    RCLCPP_INFO(
+      get_logger(), "%s: %s frames=%u elapsed=%.3fs",
+      response.success ? "ACCEPT" : "REJECT", response.message.c_str(),
+      response.accumulated_frames, response.elapsed_sec);
+    if (request_header_) {
+      try {
+        service_->send_response(*request_header_, response);
+      } catch (const std::exception & e) {
+        RCLCPP_WARN(get_logger(), "Could not send service response: %s", e.what());
+      }
+      request_header_.reset();
+    }
+    active_ = false;
+    if (job_automatic_) {
+      auto_pending_ = !response.success || !one_shot_;
+      next_auto_ = SteadyClock::now() + std::chrono::duration_cast<SteadyClock::duration>(
+        std::chrono::duration<double>(cooldown_));
+    }
+    // A timed-out worker still owns the accumulation until its result is drained.
+    if (!worker_.valid()) {
+      reset_accumulator();
+    }
+  }
+
+  void progress()
+  {
+    if (active_ && std::chrono::duration<double>(SteadyClock::now() - job_start_).count()
+        >= service_timeout_sec_) {
+      Relocalize::Response response;
+      response.message = "timeout: collection or registration exceeded service_timeout_sec";
+      finish_job(response);
+    }
+    if (worker_.valid() && worker_.wait_for(std::chrono::seconds(0)) ==
+        std::future_status::ready) {
+      PipelineResult result;
+      try {
+        result = worker_.get();
+      } catch (const std::exception & e) {
+        result.message = std::string("registration exception: ") + e.what();
+      }
+      if (!active_) {
+        RCLCPP_WARN(get_logger(), "Discarding late registration result");
+        reset_accumulator();
+      } else if (result.outcome == PipelineResult::NEED_MORE &&
+          !accumulation_extended_ && additional_accumulate_frames_ > 0) {
+        accumulation_extended_ = true;
+        RCLCPP_WARN(
+          get_logger(), "有效累积不足: %s; 保留 %d 帧并追加 %d 帧，到 %d 帧重新检验",
+          result.message.c_str(), frame_count_, additional_accumulate_frames_,
+          accumulate_frames_ + additional_accumulate_frames_);
+      } else {
+        Relocalize::Response response;
+        response.message = result.message;
+        if (result.outcome == PipelineResult::ACCEPTED) {
+          map_to_odom_ = result.pose * result.odom_pose.inverse();
+          response.success = true;
+          response.pose.header.frame_id = map_frame_;
+          response.pose.header.stamp = result.stamp;
+          response.pose.pose = matrix_pose(result.pose);
+          response.map_to_odom = correction_transform(result.stamp);
+          response.rmse = result.rmse;
+          response.overlap_ratio = result.overlap.ratio;
+          response.correspondences = result.overlap.correspondences;
+          publisher_->publish(response.pose);
+          publish_map_to_odom();
+        }
+        finish_job(response);
+      }
+    }
+    if (auto_pending_ && !active_ && !worker_.valid() && SteadyClock::now() >= next_auto_) {
+      Relocalize::Request request;
+      request.mode = Relocalize::Request::ODOMETRY;
+      std::string error;
+      if (!begin_job(request, true, error)) {
+        next_auto_ = SteadyClock::now() + std::chrono::duration_cast<SteadyClock::duration>(
+          std::chrono::duration<double>(std::max(cooldown_, 0.1)));
+        RCLCPP_WARN(get_logger(), "Startup relocalization waiting: %s", error.c_str());
+      }
     }
   }
 
@@ -340,6 +541,9 @@ private:
         "先验地图在 z∈[" + std::to_string(z_min_) + ", " +
         std::to_string(z_max_) + "] 内点数不足，检查 pcd_file 和高度带");
     }
+    if (static_cast<int>(target_fine_->size()) < gicp_correspondence_randomness_) {
+      throw std::runtime_error("Fine target has fewer points than GICP covariance neighbors");
+    }
     target_fine_tree_.setInputCloud(target_fine_);
     RCLCPP_INFO(
       get_logger(),
@@ -348,14 +552,39 @@ private:
       target_fine_->size(), fine_map_voxel_);
   }
 
-  void publish_map_to_odom()
+  static geometry_msgs::msg::Pose matrix_pose(const Eigen::Matrix4f & matrix)
+  {
+    geometry_msgs::msg::Pose pose;
+    pose.position.x = matrix(0, 3);
+    pose.position.y = matrix(1, 3);
+    pose.position.z = matrix(2, 3);
+    Eigen::Quaternionf q(matrix.block<3, 3>(0, 0));
+    q.normalize();
+    pose.orientation.x = q.x();
+    pose.orientation.y = q.y();
+    pose.orientation.z = q.z();
+    pose.orientation.w = q.w();
+    return pose;
+  }
+
+  geometry_msgs::msg::TransformStamped correction_transform(
+    const builtin_interfaces::msg::Time & stamp) const
   {
     geometry_msgs::msg::TransformStamped tf;
-    tf.header.stamp = now();
-    tf.header.frame_id = "map";
+    tf.header.stamp = stamp;
+    tf.header.frame_id = map_frame_;
     tf.child_frame_id = odom_frame_;
-    tf.transform.rotation.w = 1.0;
-    static_broadcaster_->sendTransform(tf);
+    const auto pose = matrix_pose(map_to_odom_);
+    tf.transform.translation.x = pose.position.x;
+    tf.transform.translation.y = pose.position.y;
+    tf.transform.translation.z = pose.position.z;
+    tf.transform.rotation = pose.orientation;
+    return tf;
+  }
+
+  void publish_map_to_odom()
+  {
+    broadcaster_->sendTransform(correction_transform(now()));
   }
 
   void reset_accumulator()
@@ -364,24 +593,6 @@ private:
     frame_clouds_.clear();
     frame_count_ = 0;
     accumulation_extended_ = false;
-  }
-
-  void handle_insufficient_accumulation(const char * reason)
-  {
-    if (!accumulation_extended_ && additional_accumulate_frames_ > 0) {
-      accumulation_extended_ = true;
-      RCLCPP_WARN(
-        get_logger(),
-        "有效累积不足: %s，当前 %d 帧，保留点云并追加 %d 帧，到 %d 帧重新检验（稳住别动）",
-        reason, frame_count_, additional_accumulate_frames_,
-        accumulate_frames_ + additional_accumulate_frames_);
-      return;
-    }
-
-    RCLCPP_WARN(
-      get_logger(), "REJECT: 累积 %d 帧后%s，重置累积", frame_count_, reason);
-    last_attempt_ = std::chrono::steady_clock::now();
-    reset_accumulator();
   }
 
   bool lookup(
@@ -409,32 +620,6 @@ private:
         target_frame.c_str(), source_frame.c_str(), e.what());
       return false;
     }
-  }
-
-  Eigen::Matrix4f initial_guess(bool * used_odom = nullptr)
-  {
-    if (used_odom) {
-      *used_odom = false;
-    }
-    Eigen::Matrix4f guess = Eigen::Matrix4f::Identity();
-    guess.block<3, 3>(0, 0) =
-      Eigen::AngleAxisf(static_cast<float>(initial_yaw_), Eigen::Vector3f::UnitZ())
-      .toRotationMatrix();
-    guess.block<3, 1>(0, 3) = Eigen::Vector3f(
-      static_cast<float>(initial_x_), static_cast<float>(initial_y_),
-      static_cast<float>(initial_z_));
-
-    if (!use_odom_as_initial_guess_) {
-      return guess;
-    }
-    Eigen::Matrix4f odom;
-    if (!lookup(odom_frame_, base_frame_, odom)) {
-      return guess;
-    }
-    if (used_odom) {
-      *used_odom = true;
-    }
-    return odom * guess;
   }
 
   PointCloud::Ptr time_consistency_filter() const
@@ -498,7 +683,8 @@ private:
     RegistrationResult result;
     result.converged = icp.hasConverged();
     result.transform = icp.getFinalTransformation();
-    result.rmse = std::sqrt(icp.getFitnessScore(coarse_max_correspondence_distance_));
+    result.rmse = std::sqrt(icp.getFitnessScore(
+      coarse_max_correspondence_distance_ * coarse_max_correspondence_distance_));
     result.elapsed =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     return result;
@@ -523,7 +709,8 @@ private:
     RegistrationResult result;
     result.converged = gicp.hasConverged();
     result.transform = gicp.getFinalTransformation();
-    result.rmse = std::sqrt(gicp.getFitnessScore(fine_max_correspondence_distance_));
+    result.rmse = std::sqrt(gicp.getFitnessScore(
+      fine_max_correspondence_distance_ * fine_max_correspondence_distance_));
     result.elapsed =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     return result;
@@ -583,16 +770,18 @@ private:
 
   bool validate_final_result(
     const RegistrationResult & fine, const Eigen::Matrix4f & guess,
-    const OverlapStats & overlap) const
+    const OverlapStats & overlap, std::string & reason) const
   {
-    if (!fine.converged) {
+    if (!fine.converged || !fine.transform.allFinite() || !std::isfinite(fine.rmse)) {
       RCLCPP_WARN(get_logger(), "REJECT: Fine GICP 未收敛");
+      reason = "fine GICP did not converge";
       return false;
     }
     if (fine.rmse > fine_fitness_threshold_) {
       RCLCPP_WARN(
         get_logger(), "REJECT: Fine GICP 残差 %.3fm > %.3fm",
         fine.rmse, fine_fitness_threshold_);
+      reason = "fine GICP RMSE exceeds threshold";
       return false;
     }
     if (overlap.correspondences < min_correspondences_ ||
@@ -601,6 +790,7 @@ private:
         get_logger(), "REJECT: overlap %.1f%% (%d pts) 不足，阈值 %.1f%% / %d pts",
         overlap.ratio * 100.0, overlap.correspondences,
         min_overlap_ratio_ * 100.0, min_correspondences_);
+      reason = "insufficient final correspondences or overlap";
       return false;
     }
 
@@ -613,22 +803,25 @@ private:
       RCLCPP_WARN(
         get_logger(), "REJECT: roll/pitch=%.1f° > %.1f°",
         tilt_deg, max_roll_pitch_deg_);
+      reason = "roll/pitch exceeds threshold";
       return false;
     }
 
-    const Eigen::Matrix4f correction = fine.transform * guess.inverse();
-    const double correction_dist = correction.block<3, 1>(0, 3).norm();
+    const double correction_dist =
+      (fine.transform.block<3, 1>(0, 3) - guess.block<3, 1>(0, 3)).norm();
     const double yaw_correction = std::abs(wrap_deg(yaw_deg(fine.transform) - yaw_deg(guess)));
     if (correction_dist > max_correction_dist_) {
       RCLCPP_WARN(
         get_logger(), "REJECT: 相对初值平移 %.2fm > %.2fm",
         correction_dist, max_correction_dist_);
+      reason = "translation correction exceeds threshold";
       return false;
     }
     if (yaw_correction > max_yaw_correction_deg_) {
       RCLCPP_WARN(
         get_logger(), "REJECT: yaw 修正 %.1f° > %.1f°",
         yaw_correction, max_yaw_correction_deg_);
+      reason = "yaw correction exceeds threshold";
       return false;
     }
     return true;
@@ -659,203 +852,132 @@ private:
     }
     PointCloud::Ptr aligned(new PointCloud());
     pcl::transformPointCloud(*cloud, *aligned, transform);
-    publish_debug_cloud(publisher, aligned, odom_frame_, stamp);
+    publish_debug_cloud(publisher, aligned, map_frame_, stamp);
   }
 
   void cloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
   {
-    if (!active_ || done_) {
+    if (!active_ || worker_.valid()) {
       return;
     }
-    const auto now_time = std::chrono::steady_clock::now();
-    if (std::chrono::duration<double>(now_time - start_time_).count() < startup_delay_) {
+    const rclcpp::Time stamp(msg->header.stamp, get_clock()->get_clock_type());
+    if (stamp <= accepted_after_ || stamp <= last_cloud_stamp_) {
+      return;  // Do not collect queued, duplicated or out-of-order scans.
+    }
+    if (msg->header.frame_id.empty()) {
       return;
     }
-    if (std::chrono::duration<double>(now_time - last_attempt_).count() < cooldown_) {
-      return;
-    }
-
     PointCloud::Ptr cloud(new PointCloud());
     pcl::fromROSMsg(*msg, *cloud);
-    if (cloud->empty()) {
-      return;
-    }
-
-    if (!msg->header.frame_id.empty() && msg->header.frame_id != base_frame_) {
+    if (msg->header.frame_id != base_frame_) {
       Eigen::Matrix4f transform;
       if (!lookup(base_frame_, msg->header.frame_id, transform)) {
         return;
       }
       pcl::transformPointCloud(*cloud, *cloud, transform);
     }
-
     PointCloud::Ptr frame = filter_and_downsample(cloud, fine_source_voxel_);
-    // Sparse non-empty frames can still contribute to a valid accumulated cloud.
     if (frame->empty()) {
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 5000, "实时点云过滤后为空，跳过");
       return;
     }
-
-    if (!have_run_initial_guess_) {
-      run_initial_guess_ = initial_guess(&run_initial_guess_used_odom_);
-      have_run_initial_guess_ = true;
-      RCLCPP_INFO(
-        get_logger(), "本轮自动初值[%s]: xyz=(%.3f, %.3f, %.3f) yaw=%.1f°",
-        run_initial_guess_used_odom_ ? "FAST-LIO odom TF" : "YAML fallback",
-        run_initial_guess_(0, 3), run_initial_guess_(1, 3), run_initial_guess_(2, 3),
-        yaw_deg(run_initial_guess_));
-    }
-
+    last_cloud_stamp_ = stamp;
     *accumulated_raw_ += *frame;
     frame_clouds_.push_back(frame);
     ++frame_count_;
     const int target_frames = accumulate_frames_ +
       (accumulation_extended_ ? additional_accumulate_frames_ : 0);
-    if (frame_count_ < target_frames) {
-      RCLCPP_INFO_THROTTLE(
-        get_logger(), *get_clock(), 2000, "累积点云 %d/%d 帧（%zu 点，稳住别动）",
-        frame_count_, target_frames, accumulated_raw_->size());
-      return;
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 1000, "累积点云 %d/%d 帧（%zu 点，稳住别动）",
+      frame_count_, target_frames, accumulated_raw_->size());
+    if (frame_count_ >= target_frames) {
+      // Accumulation is immutable until progress() drains this future.
+      worker_ = std::async(std::launch::async, [this, stamp]() {
+        return register_cloud(stamp);
+      });
     }
-
-    const auto pipeline_started = std::chrono::steady_clock::now();
-    const auto stamp = msg->header.stamp;
-    publish_debug_cloud(debug_accumulated_pub_, accumulated_raw_, base_frame_, stamp);
-
-    PointCloud::Ptr stable_cloud = time_consistency_filter();
-    publish_debug_cloud(debug_time_filtered_pub_, stable_cloud, base_frame_, stamp);
-    if (static_cast<int>(stable_cloud->size()) < min_source_points_) {
-      RCLCPP_WARN(
-        get_logger(), "时间过滤后点数 %zu < %d",
-        stable_cloud->size(), min_source_points_);
-      handle_insufficient_accumulation("时间过滤后点数不足");
-      return;
-    }
-
-    PointCloud::Ptr coarse_source = downsample(stable_cloud, coarse_source_voxel_);
-    PointCloud::Ptr fine_source = downsample(stable_cloud, fine_source_voxel_);
-    // Fine registration cannot produce more correspondences than source points.
-    const int min_fine_points = std::max(
-      min_source_points_, std::max(min_map_consistent_points_, min_correspondences_));
-    RCLCPP_INFO(
-      get_logger(),
-      "有效累积检验: frames=%d raw=%zu stable=%zu coarse=%zu/%d fine=%zu/%d",
-      frame_count_, accumulated_raw_->size(), stable_cloud->size(),
-      coarse_source->size(), min_source_points_, fine_source->size(), min_fine_points);
-    if (static_cast<int>(coarse_source->size()) < min_source_points_ ||
-        static_cast<int>(fine_source->size()) < min_fine_points) {
-      handle_insufficient_accumulation("降采样后有效点数不足");
-      return;
-    }
-
-    // Extending accumulation must not start the registration cooldown.
-    last_attempt_ = now_time;
-    const Eigen::Matrix4f guess = run_initial_guess_;
-    RCLCPP_INFO(
-      get_logger(), "初始 pose: xyz=(%.3f, %.3f, %.3f) yaw=%.1f°",
-      guess(0, 3), guess(1, 3), guess(2, 3), yaw_deg(guess));
-
-    const RegistrationResult coarse = run_coarse_icp(coarse_source, guess);
-    RCLCPP_INFO(
-      get_logger(),
-      "粗配准: converged=%s xyz=(%.3f, %.3f, %.3f) yaw=%.1f° yaw_delta=%.1f° fitness=%.3fm time=%.2fs",
-      coarse.converged ? "true" : "false", coarse.transform(0, 3), coarse.transform(1, 3),
-      coarse.transform(2, 3), yaw_deg(coarse.transform),
-      wrap_deg(yaw_deg(coarse.transform) - yaw_deg(guess)), coarse.rmse, coarse.elapsed);
-    publish_aligned_debug_cloud(debug_coarse_pub_, coarse_source, coarse.transform, stamp);
-
-    if (!coarse.converged) {
-      RCLCPP_WARN(get_logger(), "REJECT: Coarse ICP 未收敛");
-      reset_accumulator();
-      return;
-    }
-    if (coarse.rmse > coarse_fitness_threshold_) {
-      RCLCPP_WARN(
-        get_logger(), "REJECT: Coarse ICP 残差 %.3fm > %.3fm",
-        coarse.rmse, coarse_fitness_threshold_);
-      reset_accumulator();
-      return;
-    }
-
-    PointCloud::Ptr map_consistent =
-      filter_by_map_consistency(fine_source, coarse.transform);
-    publish_aligned_debug_cloud(
-      debug_map_filtered_pub_, map_consistent, coarse.transform, stamp);
-    if (static_cast<int>(map_consistent->size()) < min_map_consistent_points_) {
-      RCLCPP_WARN(
-        get_logger(), "REJECT: 地图一致点 %zu < %d",
-        map_consistent->size(), min_map_consistent_points_);
-      reset_accumulator();
-      return;
-    }
-
-    const RegistrationResult fine = run_fine_gicp(map_consistent, coarse.transform);
-    const OverlapStats overlap =
-      compute_overlap(map_consistent, fine.transform, overlap_distance_);
-    RCLCPP_INFO(
-      get_logger(),
-      "精配准: converged=%s xyz=(%.3f, %.3f, %.3f) yaw=%.1f° yaw_delta_init=%.1f° yaw_delta_coarse=%.1f° fitness=%.3fm overlap=%.1f%%(%d/%zu) time=%.2fs",
-      fine.converged ? "true" : "false", fine.transform(0, 3), fine.transform(1, 3),
-      fine.transform(2, 3), yaw_deg(fine.transform),
-      wrap_deg(yaw_deg(fine.transform) - yaw_deg(guess)),
-      wrap_deg(yaw_deg(fine.transform) - yaw_deg(coarse.transform)), fine.rmse,
-      overlap.ratio * 100.0, overlap.correspondences, map_consistent->size(),
-      fine.elapsed);
-    publish_aligned_debug_cloud(debug_fine_pub_, map_consistent, fine.transform, stamp);
-
-    if (!validate_final_result(fine, guess, overlap)) {
-      reset_accumulator();
-      return;
-    }
-
-    const double elapsed =
-      std::chrono::duration<double>(std::chrono::steady_clock::now() - pipeline_started).count();
-    RCLCPP_INFO(
-      get_logger(),
-      "ACCEPT: coarse_fitness=%.3fm fine_fitness=%.3fm overlap=%.1f%% corr=%d total_time=%.2fs",
-      coarse.rmse, fine.rmse, overlap.ratio * 100.0, overlap.correspondences, elapsed);
-    publish_pose(msg, fine.transform, fine.rmse, overlap, elapsed);
   }
 
-  void publish_pose(
-    const sensor_msgs::msg::PointCloud2::SharedPtr msg,
-    const Eigen::Matrix4f & transform, double rmse, const OverlapStats & overlap,
-    double elapsed)
+  Eigen::Matrix4f reference_odometry(const rclcpp::Time & stamp) const
   {
-    const Eigen::Vector3f t = transform.block<3, 1>(0, 3);
-    Eigen::Quaternionf q(transform.block<3, 3>(0, 0));
-    q.normalize();
+    const auto deadline = SteadyClock::now() + std::chrono::duration_cast<SteadyClock::duration>(
+      std::chrono::duration<double>(tf_wait_sec_));
+    std::string error;
+    do {
+      try {
+        // No ROS-clock-based timeout: /clock may be paused.
+        const auto tf = tf_buffer_->lookupTransform(odom_frame_, base_frame_, stamp);
+        geometry_msgs::msg::Pose pose;
+        pose.position.x = tf.transform.translation.x;
+        pose.position.y = tf.transform.translation.y;
+        pose.position.z = tf.transform.translation.z;
+        pose.orientation = tf.transform.rotation;
+        return pose_matrix(pose);
+      } catch (const tf2::TransformException & e) {
+        error = e.what();
+      }
+      if (!rclcpp::ok() || SteadyClock::now() >= deadline) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    } while (true);
+    throw std::runtime_error("missing odom -> base_link at reference scan timestamp: " + error);
+  }
 
-    geometry_msgs::msg::PoseStamped pose;
-    pose.header.frame_id = odom_frame_;
-    pose.header.stamp = msg->header.stamp;
-    pose.pose.position.x = t.x();
-    pose.pose.position.y = t.y();
-    pose.pose.position.z = t.z();
-    pose.pose.orientation.x = q.x();
-    pose.pose.orientation.y = q.y();
-    pose.pose.orientation.z = q.z();
-    pose.pose.orientation.w = q.w();
-    publisher_->publish(pose);
-
+  PipelineResult register_cloud(const rclcpp::Time & stamp) const
+  {
+    PipelineResult result;
+    result.stamp = stamp;
+    publish_debug_cloud(debug_accumulated_pub_, accumulated_raw_, base_frame_, stamp);
+    PointCloud::Ptr stable = time_consistency_filter();
+    publish_debug_cloud(debug_time_filtered_pub_, stable, base_frame_, stamp);
+    PointCloud::Ptr coarse_source = downsample(stable, coarse_source_voxel_);
+    PointCloud::Ptr fine_source = downsample(stable, fine_source_voxel_);
+    const int min_fine = std::max(
+      min_source_points_, std::max(min_map_consistent_points_, min_correspondences_));
     RCLCPP_INFO(
-      get_logger(),
-      "重定位成功：xyz=(%.3f, %.3f, %.3f) yaw=%.1f° | Fine 残差 %.3fm | overlap %.1f%% | 用时 %.2fs | 已发到 %s",
-      t.x(), t.y(), t.z(), yaw_deg(transform), rmse, overlap.ratio * 100.0, elapsed,
-      output_topic_.c_str());
-
-    if (publish_static_map_to_odom_) {
-      publish_map_to_odom();
+      get_logger(), "有效累积检验: frames=%d raw=%zu stable=%zu coarse=%zu/%d fine=%zu/%d",
+      frame_count_, accumulated_raw_->size(), stable->size(), coarse_source->size(),
+      min_source_points_, fine_source->size(), min_fine);
+    if (static_cast<int>(stable->size()) < min_source_points_ ||
+        static_cast<int>(coarse_source->size()) < min_source_points_ ||
+        static_cast<int>(fine_source->size()) < min_fine) {
+      result.outcome = PipelineResult::NEED_MORE;
+      result.message = "insufficient effective points after temporal/voxel filtering";
+      return result;
     }
-
-    if (one_shot_) {
-      active_ = false;
-      done_ = true;
-      RCLCPP_INFO(get_logger(), "one_shot=true，停止后续匹配");
-    } else {
-      reset_accumulator();
+    result.odom_pose = reference_odometry(stamp);
+    const auto coarse = run_coarse_icp(coarse_source, run_initial_guess_);
+    publish_aligned_debug_cloud(debug_coarse_pub_, coarse_source, coarse.transform, stamp);
+    RCLCPP_INFO(get_logger(), "粗配准: converged=%s fitness=%.3fm time=%.3fs",
+      coarse.converged ? "true" : "false", coarse.rmse, coarse.elapsed);
+    if (!coarse.converged || !std::isfinite(coarse.rmse) ||
+        !coarse.transform.allFinite() || coarse.rmse > coarse_fitness_threshold_) {
+      result.message = "coarse ICP failed convergence or RMSE gate";
+      return result;
     }
+    const auto consistent = filter_by_map_consistency(fine_source, coarse.transform);
+    publish_aligned_debug_cloud(debug_map_filtered_pub_, consistent, coarse.transform, stamp);
+    if (static_cast<int>(consistent->size()) < min_map_consistent_points_ ||
+        static_cast<int>(consistent->size()) < min_correspondences_ ||
+        static_cast<int>(consistent->size()) < gicp_correspondence_randomness_) {
+      result.message = "insufficient map-consistent points for GICP/final correspondences";
+      return result;
+    }
+    const auto fine = run_fine_gicp(consistent, coarse.transform);
+    const auto overlap = compute_overlap(consistent, fine.transform, overlap_distance_);
+    RCLCPP_INFO(
+      get_logger(), "精配准: fitness=%.3fm overlap=%.1f%%(%d/%zu) time=%.3fs",
+      fine.rmse, overlap.ratio * 100.0, overlap.correspondences, consistent->size(), fine.elapsed);
+    publish_aligned_debug_cloud(debug_fine_pub_, consistent, fine.transform, stamp);
+    if (!validate_final_result(fine, run_initial_guess_, overlap, result.message)) {
+      return result;
+    }
+    result.outcome = PipelineResult::ACCEPTED;
+    result.message = "relocalized: map -> odom updated; local odometry remains continuous";
+    result.pose = fine.transform;
+    result.rmse = fine.rmse;
+    result.overlap = overlap;
+    return result;
   }
 
   std::string pcd_file_;
@@ -883,8 +1005,8 @@ private:
   double min_overlap_ratio_{0.35};
   double overlap_distance_{0.5};
   double map_consistency_distance_{0.5};
-  int accumulate_frames_{30};
-  int additional_accumulate_frames_{20};
+  int accumulate_frames_{10};
+  int additional_accumulate_frames_{10};
   PointCloud::Ptr accumulated_raw_{new PointCloud()};
   std::vector<PointCloud::Ptr> frame_clouds_;
   int frame_count_{0};
@@ -893,7 +1015,6 @@ private:
   double max_roll_pitch_deg_{10.0};
   double max_correction_dist_{2.0};
   double max_yaw_correction_deg_{35.0};
-  bool use_odom_as_initial_guess_{true};
   double initial_x_{0.0};
   double initial_y_{0.0};
   double initial_z_{0.0};
@@ -901,7 +1022,7 @@ private:
   bool one_shot_{true};
   bool auto_relocalize_on_start_{true};
   double cooldown_{3.0};
-  bool publish_static_map_to_odom_{true};
+
   bool time_consistency_filter_en_{true};
   double time_consistency_voxel_{0.15};
   double time_consistency_min_ratio_{0.35};
@@ -912,17 +1033,35 @@ private:
   PointCloud::Ptr target_coarse_;
   PointCloud::Ptr target_fine_;
   pcl::KdTreeFLANN<pcl::PointXYZ> target_fine_tree_;
-  std::chrono::steady_clock::time_point last_attempt_{};
-  std::chrono::steady_clock::time_point start_time_{std::chrono::steady_clock::now()};
+  SteadyClock::time_point job_start_{};
+  SteadyClock::time_point next_auto_{};
+  SteadyClock::time_point odom_received_{};
   Eigen::Matrix4f run_initial_guess_{Eigen::Matrix4f::Identity()};
-  bool have_run_initial_guess_{false};
-  bool run_initial_guess_used_odom_{false};
-  bool active_{true};
-  bool done_{false};
+  bool active_{false};
+  bool auto_pending_{false};
+  bool job_automatic_{false};
+  bool have_odom_{false};
+  std::string map_frame_;
+  std::string odom_topic_;
+  double service_timeout_sec_{10.0};
+  double odom_max_age_sec_{0.5};
+  double tf_wait_sec_{0.2};
+  double map_to_odom_publish_rate_{20.0};
+  Eigen::Matrix4f map_to_odom_{Eigen::Matrix4f::Identity()};
+  Eigen::Matrix4f odom_pose_{Eigen::Matrix4f::Identity()};
+  rclcpp::Time odom_stamp_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time accepted_after_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_cloud_stamp_{0, 0, RCL_ROS_TIME};
+  std::future<PipelineResult> worker_;
+  std::shared_ptr<rmw_request_id_t> request_header_;
+  rclcpp::Service<Relocalize>::SharedPtr service_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_subscription_;
+  rclcpp::TimerBase::SharedPtr tf_timer_;
+  rclcpp::TimerBase::SharedPtr progress_timer_;
 
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
-  std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_broadcaster_;
+  std::unique_ptr<tf2_ros::TransformBroadcaster> broadcaster_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr publisher_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr debug_accumulated_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr debug_time_filtered_pub_;

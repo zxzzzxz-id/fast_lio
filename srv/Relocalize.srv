@@ -1,0 +1,19 @@
+# MANUAL: x/y/z [m], yaw_deg [degrees], all in map. ODOMETRY ignores these fields.
+uint8 MANUAL=0
+uint8 ODOMETRY=1
+uint8 mode
+float64 x
+float64 y
+float64 z
+float64 yaw_deg
+---
+# Pose, transform and quality fields are valid only when success is true.
+bool success
+string message
+geometry_msgs/PoseStamped pose
+geometry_msgs/TransformStamped map_to_odom
+float64 rmse
+float64 overlap_ratio
+uint32 correspondences
+uint32 accumulated_frames
+float64 elapsed_sec
