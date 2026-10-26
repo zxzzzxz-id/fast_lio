@@ -7,7 +7,7 @@
 ## 构建与启动
 
 ```bash
-cd /home/zxz/workspace/fast_lio_ws
+cd ~/workspace/localization_ws
 source /opt/ros/humble/setup.bash
 colcon build --symlink-install --executor sequential --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
@@ -17,7 +17,7 @@ ros2 launch fast_lio mapping_mid360.launch.py
 
 # 定位：与建图二选一；不会在退出时覆盖先验图
 ros2 launch fast_lio reloc_mid360.launch.py \
-  map_pcd:=/home/zxz/workspace/fast_lio_ws/src/fast_lio/PCD/scans.pcd
+  map_pcd:=$HOME/workspace/localization_ws/src/fast_lio/PCD/scans.pcd
 ```
 
 雷达驱动需提供 `/livox/lidar`（`livox_ros_driver2/msg/CustomMsg`）和 `/livox/imu`。

@@ -1,0 +1,42 @@
+# ROS / colcon local build outputs
+/build/
+/install/
+/log/
+
+# Maps and runtime debug output
+/PCD/*
+!/PCD/.gitkeep
+/Log/
+*.pcd
+*.bag
+*.bag.active
+*.db3
+*.db3-shm
+*.db3-wal
+*.mcap
+*.mcap.active
+*.log
+
+# CMake / compiler outputs
+CMakeFiles/
+CMakeCache.txt
+CMakeUserPresets.json
+cmake_install.cmake
+compile_commands.json
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+
+# Python and editor caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
